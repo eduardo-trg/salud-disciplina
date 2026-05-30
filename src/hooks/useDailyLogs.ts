@@ -1,44 +1,36 @@
-import { useEffect, useState } from 'react';
-import { db, auth } from '../lib/firebase';
-import { collection, getDocs } from 'firebase/firestore';
-import type { MealItem, DrinkItem } from '../lib/offlineStorage';
+import { useState, useEffect, useCallback } from 'react';
+import { collection, query, orderBy, limit, getDocs } from 'firebase/firestore';
+import { db } from '../lib/firebase';
+import { useAuth } from './useAuth';
+import type { DailyLog } from '../types';
 
-export interface DailyLog {
-  id: string;
-  date: string;
-  sleep: { hours: number; quality: 1 | 2 | 3 | 4 | 5 };
-  meals: Record<string, MealItem[]>;
-  drinks: DrinkItem[];
-  activities: { type: string; minutes: number }[];
-  wellness: { energy: number; satiety: number; sleep: number };
-  metrics?: { // ✅ NUEVO
-    weight?: number;
-    bpSystolic?: number;
-    bpDiastolic?: number;
-    glucose?: number;
-    note?: string;
-  };
-}
-
-export function useDailyLogs() {
+export const useDailyLogs = (limitDays: number = 30) => {
+  const { user } = useAuth();
   const [logs, setLogs] = useState<DailyLog[]>([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
-    const fetchLogs = async () => {
-      try {
-        const userId = auth.currentUser?.uid || 'temp-user';
-        const colRef = collection(db, `users/${userId}/daily_logs`);
-        const querySnapshot = await getDocs(colRef);
-        const fetchedLogs: DailyLog[] = [];
-        querySnapshot.forEach((d) => fetchedLogs.push({ id: d.id, ...d.data() } as DailyLog));
-        const sorted = fetchedLogs.sort((a, b) => b.date.localeCompare(a.date)).slice(0, 7);
-        setLogs(sorted);
-      } catch (error) { console.error('Error al obtener logs:', error); } 
-      finally { setLoading(false); }
-    };
-    fetchLogs();
-  }, []);
+  const fetchLogs = useCallback(async () => {
+    if (!user) return;
+    try {
+      setLoading(true);
+      setError(null);
+      const logsRef = collection(db, `users/${user.uid}/daily_logs`);
+      const q = query(logsRef, orderBy('date', 'desc'), limit(limitDays));
+      const snap = await getDocs(q);
+      
+      // Cast seguro: Firestore data + doc.id coincide ahora con DailyLog flexible
+      const data = snap.docs.map(doc => ({ id: doc.id, ...(doc.data() || {}) } as DailyLog));
+      setLogs(data);
+    } catch (err) {
+      console.error('Error cargando logs:', err);
+      setError('Error al cargar historial');
+    } finally {
+      setLoading(false);
+    }
+  }, [user, limitDays]);
 
-  return { logs, loading };
-}
+  useEffect(() => { fetchLogs(); }, [fetchLogs]);
+
+  return { logs, loading, error, refetch: fetchLogs };
+};
