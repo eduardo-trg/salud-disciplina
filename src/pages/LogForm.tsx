@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { ConnectionStatus } from '../components/ConnectionStatus';
 import { BottomNav } from '../components/BottomNav';
@@ -6,7 +6,8 @@ import { useFirebaseSync } from '../hooks/useFirebaseSync';
 import { FOOD_HIERARCHY, SNACK_HIERARCHY } from '../lib/offlineStorage';
 import type { MealItem, MealTime, DrinkType, DrinkItem } from '../lib/offlineStorage';
 import { db, auth } from '../lib/firebase';
-import { doc, getDoc } from 'firebase/firestore';
+import { doc, getDoc, setDoc } from 'firebase/firestore';
+import { getLocalDateISO } from '../utils/getLocalDateISO';
 
 const ACTIVITY_TYPES = ['Caminata', 'Bicicleta', 'Fuerza', 'Movilidad', 'Descanso'];
 
@@ -14,13 +15,14 @@ export default function LogForm() {
   const navigate = useNavigate();
   const { saveLog, isLoading, pendingCount } = useFirebaseSync();
 
-  const [selectedDate, setSelectedDate] = useState(() => new Date().toISOString().split('T')[0]);
+  const [isSaving, setIsSaving] = useState(false);
+  const [selectedDate, setSelectedDate] = useState(() => getLocalDateISO());
   const [existingDay, setExistingDay] = useState(false);
 
   const [meals, setMeals] = useState<Record<MealTime, MealItem[]>>({ desayuno: [], comida: [], cena: [], snack: [] });
   const [activities, setActivities] = useState<{ type: string; minutes: number }[]>([]);
   const [editingActivity, setEditingActivity] = useState(false);
-  const [tempActivity, setTempActivity] = useState({ type: '', minutes: 20 });
+  const [tempActivity, setTempActivity] = useState({ type: ACTIVITY_TYPES[0], minutes: 20 });
 
   const [foodPicker, setFoodPicker] = useState<{ meal: MealTime; step: 'subgroup' | 'food' } | null>(null);
   const [tempGroup, setTempGroup] = useState<string>('');
@@ -35,31 +37,48 @@ export default function LogForm() {
   const [tempDrink, setTempDrink] = useState<DrinkItem>({ type: 'refresco', name: '', portion: 'mediana' });
 
   const [wellness, setWellness] = useState({ energy: 3, satiety: 3, sleep: 3 });
-
   const [mealTimes, setMealTimes] = useState({ first: '', last: '' });
   const [showMetrics, setShowMetrics] = useState(false);
   const [metrics, setMetrics] = useState({ weight: '', bpSys: '', bpDia: '', glucose: '', note: '' });
 
-  useEffect(() => {
+  // ✅ CASO 2: Hidratación inteligente al cambiar de fecha
+  const loadExistingLog = useCallback(async () => {
     setMeals({ desayuno: [], comida: [], cena: [], snack: [] });
     setActivities([]); setDrinks([]);
     setWellness({ energy: 3, satiety: 3, sleep: 3 });
     setSleepHours(7); setSleepQuality(3);
-    setFoodPicker(null); setTempGroup(''); setTempSubgroup(''); setTempFood('');
-    setMealTimes({ first: '', last: '' });
-    setShowMetrics(false); setMetrics({ weight: '', bpSys: '', bpDia: '', glucose: '', note: '' });
+    setMealTimes({ first: '', last: '' }); setShowMetrics(false); setMetrics({ weight: '', bpSys: '', bpDia: '', glucose: '', note: '' });
 
-    const checkExisting = async () => {
-      try {
-        const userId = auth.currentUser?.uid;
-        if (userId) {
-          const docSnap = await getDoc(doc(db, `users/${userId}/daily_logs`, selectedDate));
-          setExistingDay(docSnap.exists());
+    try {
+      const userId = auth.currentUser?.uid;
+      if (userId) {
+        const docSnap = await getDoc(doc(db, `users/${userId}/daily_logs`, selectedDate));
+        if (docSnap.exists()) {
+          const data = docSnap.data();
+          setExistingDay(true);
+          if (data.meals) setMeals(data.meals);
+          if (data.activities) setActivities(data.activities);
+          if (data.drinks) setDrinks(data.drinks);
+          if (data.wellness) setWellness(data.wellness);
+          if (data.sleep) { setSleepHours(data.sleep.hours); setSleepQuality(data.sleep.quality); }
+          if (data.mealTimes) setMealTimes(data.mealTimes);
+          if (data.metrics) {
+            setMetrics({
+              weight: data.metrics.weight?.toString() || '',
+              bpSys: data.metrics.bpSystolic?.toString() || '',
+              bpDia: data.metrics.bpDiastolic?.toString() || '',
+              glucose: data.metrics.glucose?.toString() || '',
+              note: data.metrics.note || ''
+            });
+          }
+        } else {
+          setExistingDay(false);
         }
-      } catch { setExistingDay(false); }
-    };
-    checkExisting();
+      }
+    } catch { setExistingDay(false); }
   }, [selectedDate]);
+
+  useEffect(() => { loadExistingLog(); }, [loadExistingLog]);
 
   const handleConfirmFood = () => {
     if (!foodPicker || !tempGroup || !tempSubgroup || !tempFood) return;
@@ -85,35 +104,82 @@ export default function LogForm() {
   const removeActivity = (index: number) => setActivities(prev => prev.filter((_, i) => i !== index));
 
   const handleSaveDay = async () => {
-    const logData: any = {
-      date: selectedDate,
-      sleep: { hours: sleepHours, quality: sleepQuality },
-      meals, drinks, activities, wellness
-    };
-
-    if (mealTimes.first || mealTimes.last) {
-      logData.mealTimes = { first: mealTimes.first || '00:00', last: mealTimes.last || '00:00' };
+    const userId = auth.currentUser?.uid;
+    if (!userId) {
+      alert("❌ Error de sesión. Por favor inicia sesión de nuevo.");
+      return;
     }
-
-    const m: any = {};
-    if (metrics.weight) m.weight = Number(metrics.weight);
-    if (metrics.bpSys) m.bpSystolic = Number(metrics.bpSys);
-    if (metrics.bpDia) m.bpDiastolic = Number(metrics.bpDia);
-    if (metrics.glucose) m.glucose = Number(metrics.glucose);
-    if (metrics.note) m.note = metrics.note.trim();
-    if (Object.keys(m).length > 0) logData.metrics = m;
-
-    await saveLog(logData);
-    navigate('/');
+  
+    setIsSaving(true);
+    try {
+      // Función recursiva para eliminar undefined, null y objetos vacíos a cualquier profundidad
+      const cleanObject = (obj: any): any => {
+        if (obj === null || obj === undefined) return undefined;
+        if (typeof obj !== 'object') return obj;
+        if (Array.isArray(obj)) {
+          const cleaned = obj.map(item => cleanObject(item)).filter(item => item !== undefined);
+          return cleaned.length > 0 ? cleaned : undefined;
+        }
+        const cleaned = Object.fromEntries(
+          Object.entries(obj)
+            .map(([key, value]) => [key, cleanObject(value)])
+            .filter(([, value]) => value !== undefined)
+        );
+        return Object.keys(cleaned).length > 0 ? cleaned : undefined;
+      };
+  
+      const rawLogData = {
+        date: selectedDate,
+        sleep: { hours: sleepHours, quality: sleepQuality },
+        meals,
+        drinks,
+        activities,
+        wellness,
+        mealTimes: mealTimes.first || mealTimes.last ? mealTimes : undefined,
+        metrics: (metrics.weight || metrics.glucose || metrics.bpSys || metrics.bpDia || metrics.note) ? {
+          weight: metrics.weight ? Number(metrics.weight) : undefined,
+          bpSystolic: metrics.bpSys ? Number(metrics.bpSys) : undefined,
+          bpDiastolic: metrics.bpDia ? Number(metrics.bpDia) : undefined,
+          glucose: metrics.glucose ? Number(metrics.glucose) : undefined,
+          note: metrics.note?.trim() || undefined
+        } : undefined
+      };
+  
+      // Limpieza recursiva: elimina undefined en cualquier nivel
+      const logData = cleanObject(rawLogData);
+      if (!logData) {
+        alert("⚠️ No hay datos válidos para guardar");
+        setIsSaving(false);
+        return;
+      }
+  
+      await setDoc(doc(db, `users/${userId}/daily_logs`, selectedDate), logData, { merge: true });
+      
+      // Intenta sync offline sin bloquear si falla
+      try { if (typeof saveLog === 'function') await saveLog(logData); } catch (e) { console.log('Offline sync skipped', e); }
+  
+      alert("✅ Día guardado correctamente");
+      navigate('/', { replace: true });
+    } catch (error: any) {
+      console.error("Error al guardar día:", error);
+      alert(`❌ No se pudo guardar: ${error.message || 'Revisa tu conexión'}`);
+    } finally {
+      setIsSaving(false);
+    }
   };
-
   return (
     <div className="min-h-screen pb-24 transition-opacity duration-300">
       <ConnectionStatus />
       <main className="max-w-md mx-auto px-4 pt-6">
-        <header className="mb-6">
-          <h1 className="text-2xl font-bold">Registrar mi día</h1>
-          <p className="text-gray-600">Agrega lo que consumiste y tu actividad</p>
+        {/* ✅ CASO 3: Botón de retorno claro */}
+        <header className="mb-6 flex items-center justify-between">
+          <div>
+            <h1 className="text-2xl font-bold">Registrar mi día</h1>
+            <p className="text-gray-600">Agrega lo que consumiste y tu actividad</p>
+          </div>
+          <button onClick={() => navigate(-1)} className="text-gray-500 hover:text-gray-800 text-sm font-medium transition-colors">
+            ← Volver
+          </button>
         </header>
 
         {pendingCount > 0 && (
@@ -124,10 +190,11 @@ export default function LogForm() {
 
         <div className="bg-blue-50 border border-blue-200 rounded-xl p-3 mb-4 transition-all duration-200">
           <label className="block text-sm font-medium text-blue-800 mb-2">📆 Registrando día:</label>
-          <input type="date" value={selectedDate} max={new Date().toISOString().split('T')[0]} onChange={(e) => setSelectedDate(e.target.value)} className="w-full p-2 border rounded bg-white text-blue-900 font-medium focus:ring-2 focus:ring-blue-400 focus:border-blue-400 outline-none transition-all" />
-          {existingDay && <p className="text-xs text-blue-700 mt-1">⚠️ Este día ya tiene registros. Se actualizarán al guardar.</p>}
+          <input type="date" value={selectedDate} max={getLocalDateISO()} onChange={(e) => setSelectedDate(e.target.value)} className="w-full p-2 border rounded bg-white text-blue-900 font-medium focus:ring-2 focus:ring-blue-400 focus:border-blue-400 outline-none transition-all" />
+          {existingDay && <p className="text-xs text-blue-700 mt-1">✅ Se fusionará con registros existentes.</p>}
         </div>
 
+        {/* Resto de tu UI permanece intacta... */}
         <section className="bg-white p-4 rounded-xl shadow-sm border border-gray-100 mb-4 transition-all duration-200 hover:shadow-md hover:-translate-y-0.5">
           <h2 className="text-lg font-semibold mb-3">⏰ Horarios de alimentación</h2>
           <div className="grid grid-cols-2 gap-4">
@@ -239,7 +306,7 @@ export default function LogForm() {
             <div>
               <label className="block text-sm font-medium mb-1">Horas dormidas</label>
               <select value={sleepHours} onChange={e => setSleepHours(Number(e.target.value))} className="w-full p-2 border rounded bg-white focus:ring-2 focus:ring-purple-400 focus:border-purple-400 outline-none transition-all">
-                {[4,5,6,7,8,9,10].map(h => <option key={h} value={h}>{h}h</option>)}
+                {[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16].map(h => <option key={h} value={h}>{h}h</option>)}
               </select>
             </div>
             <div>
@@ -254,36 +321,98 @@ export default function LogForm() {
         </section>
 
         <section className="bg-white p-4 rounded-xl shadow-sm border border-gray-100 mb-4 transition-all duration-200 hover:shadow-md hover:-translate-y-0.5">
-          <h2 className="text-lg font-semibold mb-3">🥤 Bebidas</h2>
-          {drinks.length === 0 ? <p className="text-sm text-gray-400 italic mb-2">Sin registros aún</p> :
-            drinks.map((d, idx) => (
-              <span key={idx} className="inline-flex items-center gap-1 bg-gray-100 px-2 py-1 rounded text-sm mr-2 mb-2 transition-all duration-150 hover:bg-gray-200">
-                {d.name} ({d.portion})
-                <button onClick={() => setDrinks(prev => prev.filter((_, i) => i !== idx))} className="text-red-500 ml-1 hover:text-red-700 transition-colors">×</button>
-              </span>
-            ))}
-          {!editingDrink ? (
-            <button onClick={() => setEditingDrink(true)} className="w-full bg-purple-50 hover:bg-purple-100 text-purple-700 py-2 rounded-lg text-sm font-medium transition-all duration-150 active:scale-[0.98]">+ Agregar bebida</button>
-          ) : (
-            <div className="bg-gray-50 p-3 rounded-lg space-y-3 transition-all duration-200">
-              <select value={tempDrink.type} onChange={e => setTempDrink({...tempDrink, type: e.target.value as DrinkType})} className="w-full p-2 border rounded focus:ring-2 focus:ring-purple-400 focus:border-purple-400 outline-none transition-all">
-                {(['refresco','cerveza','cerveza-preparada','tragos','agua','otro'] as DrinkType[]).map(t => (
-                  <option key={t} value={t}>{t === 'cerveza-preparada' ? 'Cerveza preparada' : t === 'tragos' ? 'Tragos preparados' : t.charAt(0).toUpperCase() + t.slice(1)}</option>
-                ))}
-              </select>
-              <input type="text" placeholder="Nombre (ej: Cuba libre)" value={tempDrink.name} onChange={e => setTempDrink({...tempDrink, name: e.target.value})} className="w-full p-2 border rounded focus:ring-2 focus:ring-purple-400 focus:border-purple-400 outline-none transition-all" />
-              <div className="flex gap-2">
-                {(['pequeña','mediana','grande'] as const).map(p => (
-                  <button key={p} onClick={() => setTempDrink({...tempDrink, portion: p})} className={`flex-1 py-1 rounded text-sm transition-all duration-150 active:scale-[0.98] ${tempDrink.portion === p ? 'bg-purple-600 text-white' : 'bg-white border hover:bg-purple-50'}`}>{p}</button>
-                ))}
-              </div>
-              <div className="flex gap-2">
-                <button onClick={() => setEditingDrink(false)} className="flex-1 py-2 border rounded transition-all duration-150 active:scale-[0.98]">Cancelar</button>
-                <button onClick={() => { if(tempDrink.name) { setDrinks(prev => [...prev, {...tempDrink}]); setEditingDrink(false); setTempDrink({type:'refresco', name:'', portion:'mediana'}); } }} className="flex-1 py-2 bg-purple-600 text-white rounded transition-all duration-150 active:scale-[0.98]">Agregar</button>
-              </div>
-            </div>
-          )}
-        </section>
+  <h2 className="text-lg font-semibold mb-3">🥤 Bebidas</h2>
+  
+  {/* Lista de bebidas registradas */}
+  {drinks.length === 0 ? <p className="text-sm text-gray-400 italic mb-2">Sin registros aún</p> :
+    drinks.map((d, idx) => (
+      <span key={idx} className="inline-flex items-center gap-1 bg-gray-100 px-2 py-1 rounded text-sm mr-2 mb-2 transition-all duration-150 hover:bg-gray-200">
+        {d.name} ({d.portion})
+        <button onClick={() => setDrinks(prev => prev.filter((_, i) => i !== idx))} className="text-red-500 ml-1 hover:text-red-700 transition-colors">×</button>
+      </span>
+    ))}
+
+  {/* Toggle: Mostrar/Ocultar formulario */}
+  {!editingDrink ? (
+    <button 
+      onClick={() => setEditingDrink(true)} 
+      className="w-full bg-purple-50 hover:bg-purple-100 text-purple-700 py-2 rounded-lg text-sm font-medium transition-all duration-150 active:scale-[0.98]"
+    >
+      + Agregar bebida
+    </button>
+  ) : (
+    /* Formulario de bebida */
+    <div className="bg-gray-50 p-3 rounded-lg space-y-3 transition-all duration-200">
+      <div className="flex justify-between items-center">
+        <span className="text-sm font-medium">Nueva bebida</span>
+        <button onClick={() => setEditingDrink(false)} className="text-gray-400 hover:text-gray-600 text-xs">✕</button>
+      </div>
+      
+      <select 
+        value={tempDrink.type} 
+        onChange={e => setTempDrink({...tempDrink, type: e.target.value as DrinkType})} 
+        className="w-full p-2 border rounded focus:ring-2 focus:ring-purple-400 focus:border-purple-400 outline-none transition-all"
+      >
+        {(['refresco','cerveza','cerveza-preparada','tragos','agua','otro'] as DrinkType[]).map(t => (
+          <option key={t} value={t}>
+            {t === 'cerveza-preparada' ? 'Cerveza preparada' : 
+             t === 'tragos' ? 'Tragos preparados' : 
+             t.charAt(0).toUpperCase() + t.slice(1)}
+          </option>
+        ))}
+      </select>
+      
+      <input 
+        type="text" 
+        placeholder="Nombre (ej: Cuba libre, Agua con limón)" 
+        value={tempDrink.name} 
+        onChange={e => setTempDrink({...tempDrink, name: e.target.value})} 
+        className="w-full p-2 border rounded focus:ring-2 focus:ring-purple-400 focus:border-purple-400 outline-none transition-all"
+      />
+      
+      <div className="flex gap-2">
+        {(['pequeña','mediana','grande'] as const).map(p => (
+          <button 
+            key={p} 
+            onClick={() => setTempDrink({...tempDrink, portion: p})} 
+            className={`flex-1 py-1 rounded text-sm transition-all duration-150 active:scale-[0.98] ${
+              tempDrink.portion === p ? 'bg-purple-600 text-white' : 'bg-white border hover:bg-purple-50'
+            }`}
+          >
+            {p}
+          </button>
+        ))}
+      </div>
+      
+      <div className="flex gap-2">
+        <button 
+          onClick={() => {
+            setEditingDrink(false);
+            setTempDrink({ type: 'refresco', name: '', portion: 'mediana' });
+          }} 
+          className="flex-1 py-2 border rounded transition-all duration-150 active:scale-[0.98]"
+        >
+          Cancelar
+        </button>
+        <button 
+          onClick={() => {
+            // Validación: solo requiere nombre, el tipo ya tiene valor por defecto
+            if (!tempDrink.name.trim()) {
+              alert("⚠️ Escribe un nombre para la bebida");
+              return;
+            }
+            setDrinks(prev => [...prev, { ...tempDrink }]);
+            setEditingDrink(false);
+            setTempDrink({ type: 'refresco', name: '', portion: 'mediana' });
+          }} 
+          className="flex-1 py-2 bg-purple-600 text-white rounded transition-all duration-150 active:scale-[0.98]"
+        >
+          Agregar
+        </button>
+      </div>
+    </div>
+  )}
+</section>
 
         <section className="bg-white p-4 rounded-xl shadow-sm border border-gray-100 mb-4 transition-all duration-200 hover:shadow-md hover:-translate-y-0.5">
           <button onClick={() => setShowMetrics(!showMetrics)} className="w-full flex items-center justify-between text-left">
@@ -338,9 +467,13 @@ export default function LogForm() {
           ))}
         </section>
 
-        <button onClick={handleSaveDay} disabled={isLoading} className={`w-full py-4 px-6 rounded-xl font-semibold text-lg shadow-md transition-all duration-150 active:scale-[0.98] ${isLoading ? 'bg-gray-400 text-white cursor-not-allowed' : 'bg-green-600 hover:bg-green-700 text-white'}`}>
-          {isLoading ? 'Guardando día...' : 'Guardar día completo ✅'}
-        </button>
+        <button 
+  onClick={handleSaveDay} 
+  disabled={isSaving || isLoading} 
+  className={`w-full py-4 px-6 rounded-xl font-semibold text-lg shadow-md transition-all duration-150 active:scale-[0.98] ${(isSaving || isLoading) ? 'bg-gray-400 text-white cursor-not-allowed' : 'bg-green-600 hover:bg-green-700 text-white'}`}
+>
+  {isSaving || isLoading ? 'Guardando día...' : 'Guardar día completo ✅'}
+</button>
       </main>
       <BottomNav />
     </div>
