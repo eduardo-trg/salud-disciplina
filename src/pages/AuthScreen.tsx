@@ -33,7 +33,7 @@ export default function AuthScreen() {
       const userCredential = isLogin
         ? await signInWithEmailAndPassword(auth, email, password)
         : await createUserWithEmailAndPassword(auth, email, password);
-
+  
       // Intentar vincular sesión anónima previa
       if (auth.currentUser?.isAnonymous && auth.currentUser !== userCredential.user) {
         try {
@@ -45,7 +45,23 @@ export default function AuthScreen() {
       }
       navigate('/', { replace: true });
     } catch (err: any) {
-      setError(err.code === 'auth/email-already-in-use' ? 'Este correo ya tiene cuenta.' : err.code === 'auth/invalid-credential' ? 'Credenciales incorrectas.' : 'Error al autenticar');
+      // 🔍 Mensajes específicos por código de Firebase
+      const errorMessages: Record<string, string> = {
+        'auth/invalid-email': 'El correo electrónico no es válido',
+        'auth/user-disabled': 'Esta cuenta ha sido deshabilitada',
+        'auth/user-not-found': 'No existe una cuenta con este correo',
+        'auth/wrong-password': 'Contraseña incorrecta',
+        'auth/email-already-in-use': 'Este correo ya tiene una cuenta registrada',
+        'auth/weak-password': 'La contraseña debe tener al menos 6 caracteres',
+        'auth/operation-not-allowed': 'El registro con email/contraseña no está habilitado. Contacta al soporte.',
+        'auth/network-request-failed': 'Error de conexión. Revisa tu internet e intenta de nuevo.',
+        'auth/too-many-requests': 'Demasiados intentos. Espera unos minutos e intenta de nuevo.',
+      };
+      
+      // Muestra el mensaje específico o el código crudo para diagnóstico
+      const message = errorMessages[err.code] || `Error [${err.code}]: ${err.message}`;
+      console.error('Auth error details:', { code: err.code, message: err.message, email });
+      setError(message);
     } finally {
       setLoading(false);
     }
@@ -108,11 +124,21 @@ export default function AuthScreen() {
 
         <button onClick={handleGuestAuth} disabled={loading} className="w-full mt-4 text-gray-500 hover:text-gray-700 text-sm transition-colors">Continuar como invitado (datos solo en este dispositivo)</button>
 
-        <p className="mt-4 text-center">
-            <a href="/recursos" className="text-gray-500 hover:text-blue-600 text-sm transition-colors">
-              📚 Ver guías gratuitas (sin registro)
-            </a>
-          </p>
+{/* Toggle entre Login y Registro */}
+<p className="text-center text-sm text-gray-600 mb-2">
+  {isLogin ? (
+    <>¿No tienes cuenta? <button type="button" onClick={() => setIsLogin(false)} className="text-blue-600 hover:underline font-medium">Crear una</button></>
+  ) : (
+    <>¿Ya tienes cuenta? <button type="button" onClick={() => setIsLogin(true)} className="text-blue-600 hover:underline font-medium">Iniciar sesión</button></>
+  )}
+</p>
+
+{/* Enlace a recursos (sin registro) */}
+<p className="text-center">
+  <a href="/recursos" className="text-gray-500 hover:text-blue-600 text-sm transition-colors">
+    📚 Ver guías gratuitas (sin registro)
+  </a>
+</p>
       </div>
     </div>
   );
